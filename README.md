@@ -100,6 +100,20 @@
   发放新任务；调高 / 新设 / 删除上限立即对后续领取生效。领取与配置变更都在单个
   `BEGIN IMMEDIATE` 事务内原子核对，并发下绝不超额；既有回执、令牌完成、判定与报表接口
   的请求 / 响应形状保持不变。
+- **投递撤销（撤销未终结终点并失效租约）**：投递操作方用
+  `POST /deliveries/{id}/revocation` 提交**投递编号 + 去空白后非空的撤销原因**。一次操作在
+  单个 `BEGIN IMMEDIATE` 事务内核对该编号的**全部终点**：最新回执为**已送达 / 永久失败的
+  终结终点保留原回执**，其余终点（无回执或最新为暂时失败）**标记撤销并使其现有租约立即
+  失效**（含尚未到期的租约，令牌随之无效）。**全部终点都已终结时返回“无可撤销项”
+  （`revoked=false`）且不留撤销记录**；至少撤销一个终点时写入一次操作记录。**同编号再次
+  撤销原样返回首次操作的逐终点结果、时间和原因**（忽略新提交的原因），
+  `GET /deliveries/{id}/revocation` 可随时查询。撤销后：**领取不再返回已撤销终点**；
+  **直接回执的新尝试**报 `409 endpoint_revoked`、**令牌完成**报
+  `409 invalid_lease_token`（`reason="revoked"`），但**已记录回执的同序号同结果重试仍原样
+  返回**。撤销与领取 / 回执并发时**按事务提交顺序裁决**：回执先提交并终结则撤销保留它，
+  撤销先提交则回执被拒绝，**撤销之后绝不发出新租约、不写入新回执**。**未知编号（404）、
+  原判定失败（409）、空原因（422）明确报错且不留记录**。撤销只写独立的撤销表，**既有判定
+  重放、历史核对报表、灰度熔断统计完全不变，回执查询仍只反映实际尝试**。
 
 ## 一键启动（Docker Compose）
 
@@ -160,6 +174,8 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
 | POST | `/deliveries/{id}/receipts` | 投递结果回执：按终点 + 正整数序号回传实际投递结果 |
 | GET  | `/deliveries/{id}/receipts` | 查询各终点尝试记录（按序号升序）与汇总状态         |
+| POST | `/deliveries/{id}/revocation` | 投递撤销：撤销未终结终点并失效现有租约（原因非空，逐终点结果可幂等重放） |
+| GET  | `/deliveries/{id}/revocation` | 查询首次撤销的逐终点结果、时间与原因（无记录 404） |
 | POST | `/deliveries/claims`        | 投递任务领取：按到期时刻/编号/终点排序领取终点任务并设租约 |
 | POST | `/deliveries/claims/{token}/complete` | 凭有效租约令牌提交回执，原子写入并结束租约   |
 | GET  | `/deliveries/claims/domain-limits` | 列出全部终点邮箱域名的同时在途领取数上限   |
@@ -1087,6 +1103,90 @@ curl -X DELETE http://localhost:8000/deliveries/claims/domain-limits/mail.exampl
 `alice` 的令牌被完成（或其租约到期 / 被直接回执抢先）后再次领取，才会按到期顺序发出
 该域名的下一个任务（上例中为 `bob`）。
 
+## 投递撤销：撤销未终结终点并失效现有租约
+
+投递操作方在某个**已持久化的成功判定**尚未全部完成前，可以投递编号为单位撤销其**尚未
+终结**的终点任务：已送达 / 永久失败的终点不受影响，其余终点立即退出投递队列，已发出的
+租约令牌立即失效。撤销不改动判定本身，也不产生任何回执。
+
+### 25. 撤销一个投递编号（POST /deliveries/{id}/revocation）
+
+请求体只需给出**撤销原因**（服务先去空白，去空白后为空则 `422 invalid_reason`）：
+
+```bash
+curl -X POST http://localhost:8000/deliveries/msg-2026-10-05-1001/revocation \
+  -H 'Content-Type: application/json' \
+  -d '{"reason": "  收件人来电要求停止投递这批邮件  "}'
+```
+
+服务在**单个 `BEGIN IMMEDIATE` 事务**内逐个核对该判定的全部终点（按判定中持久化的终点
+顺序返回）：最新回执为 `delivered` / `permanent_failure` 的终点**已终结、保留原回执**
+（`outcome` 为其终结结果，`revoked_at` 为 `null`）；其余终点（**无回执**或最新回执为
+`temporary_failure`）**标记撤销**（`outcome="revoked"`，`revoked_at` 为本次操作时刻），
+并把它们的现有租约行置为已结束而令令牌立即失效。
+
+```json
+{
+  "delivery_id": "msg-2026-10-05-1001",
+  "revoked": true,
+  "reason": "收件人来电要求停止投递这批邮件",
+  "revoked_at": "2026-10-05T09:30:00+00:00",
+  "endpoints": [
+    {"mailbox": "alice@mail.example.com", "outcome": "delivered",         "revoked_at": null},
+    {"mailbox": "bob@mail.example.com",   "outcome": "revoked", "revoked_at": "2026-10-05T09:30:00+00:00"}
+  ]
+}
+```
+
+- **至少撤销一个终点** → `revoked=true`，并写入一条撤销操作记录（原因 / 时刻 / 逐终点结果）。
+- **全部终点都已终结**（全部已送达 / 永久失败）→ `revoked=false`、`revoked_at=null`，
+  表示**无可撤销项**，且**不留任何撤销记录**（之后 `GET` 仍为 404，见下）。
+- **同编号再次撤销原样返回首次操作**：无论第二次提交什么原因，响应与首次**逐字段一致**
+  （同样的逐终点 `outcome`、同样的 `revoked_at` 与首次原因）。
+
+### 26. 撤销后的行为约定
+
+- **领取不再返回已撤销终点**：`POST /deliveries/claims` 的入列扫描显式排除已撤销终点，
+  撤销之后绝不会为它们发出新租约；被撤销终点占用的**域名在途名额同时释放**。
+- **现有租约立即失效**：撤销事务把被撤销终点的未结束租约置为已结束，持其令牌再调
+  `POST /deliveries/claims/{token}/complete` 得到
+  `409 {"error":"invalid_lease_token","reason":"revoked",...}`，**不写入任何回执**。
+- **直接回执的新尝试被明确拒绝**：对已撤销终点调 `POST /deliveries/{id}/receipts` 的
+  任何新提交（更大序号、以及同序号不同结果）均为
+  `409 {"error":"endpoint_revoked",...}`；但**撤销前已记录回执的同序号同结果重试仍原样
+  返回**首次记录（超时重发安全，语义与未撤销时一致）。
+- **回执查询只反映实际尝试**：`GET /deliveries/{id}/receipts` 不把撤销算作一种结果，
+  汇总状态只依据真实写入的回执（撤销本身不写 `delivery_attempts`）。
+- **与领取 / 回执并发按事务提交顺序裁决**：撤销与“凭令牌完成”或直接回执并发时，由
+  `BEGIN IMMEDIATE` 的提交顺序唯一定胜负——
+  - 回执先提交并使终点终结 → 撤销看到终结结果，**保留原回执**（该终点 `outcome` 为
+    `delivered` / `permanent_failure`）；
+  - 撤销先提交 → 终点已撤销，后到的回执 / 令牌完成被上述 `409` 拒绝。
+  
+  两种交错都不会出现“撤销后仍写入新回执 / 发出新租约”。
+- **既有功能完全不变**：撤销只写独立的 `delivery_revocations` 与
+  `delivery_revocation_endpoints` 两张表（并在撤销时结束相关租约行），不触碰判定内容——
+  `GET /deliveries/{id}` 与 `POST /deliveries` 同编号重放仍返回含全部终点的原判定，
+  `/deliveries/report` 核对报表与灰度熔断统计（都只看判定行）均不变。
+
+### 27. 查询撤销结果与错误契约
+
+```bash
+curl http://localhost:8000/deliveries/msg-2026-10-05-1001/revocation
+# => 200：与首次撤销响应逐字段相同
+```
+
+| 场景 | 状态码 / error |
+| ---- | -------------- |
+| 未知投递编号（POST 与 GET 均如此） | `404 {"error":"delivery_not_found",...}` |
+| 编号存在但从未留下撤销记录（从未撤销，或撤销时全部终点已终结） | GET → `404 {"error":"revocation_not_found",...}` |
+| 原判定为路由失败（rejected / no_route / cycle），没有终点 | POST / GET → `409 {"error":"delivery_decision_failed",...}` |
+| 原因缺失，或去空白后为空（`""` / `"   "` / 制表符换行） | `422 {"error":"invalid_reason",...}`，**不留任何记录** |
+
+空原因与未知 / 失败编号的失败请求都**不占用、不写入任何撤销记录**：例如对一个全新
+成功判定先以空原因调用得到 422 后，仍可用合法原因正常撤销；撤销时若全部终点已终结，
+随后又有新回执也不会改变“本次无记录”的事实（该情形本就没有未终结终点可产生新回执）。
+
 ## 项目结构
 
 ```
@@ -1097,9 +1197,9 @@ app/
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执/任务领取）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约（含按终点域名的在途领取上限）、核对报表与灰度熔断的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/deliveries/claims、/deliveries/claims/domain-limits 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 任务领取与租约 + 终点域名在途上限 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执/投递撤销/任务领取）
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、投递撤销（撤销未终结终点并失效租约）、投递任务租约（含按终点域名的在途领取上限）、核对报表与灰度熔断的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/deliveries/{id}/revocation、/deliveries/claims、/deliveries/claims/domain-limits 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 投递撤销 + 任务领取与租约 + 终点域名在途上限 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
 Dockerfile / docker-compose.yml
 ```

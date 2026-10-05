@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、终点域名在途领取上限与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、投递撤销（撤销未终结终点并失效租约）、终点域名在途领取上限与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -135,6 +135,26 @@ CREATE TABLE IF NOT EXISTS endpoint_leases (
     completed_at     TEXT,                            -- 凭有效令牌提交回执的时刻；NULL=未结束
     result           TEXT CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
     UNIQUE (delivery_id, mailbox)
+);
+
+-- 投递撤销：投递操作方对某个已持久化“成功”判定发起一次撤销，只记录至少撤销了
+-- 一个终点的操作（全部终点已终结时不留记录；同编号再次撤销原样返回首次结果）。
+-- 撤销事务内逐终点核对：已送达 / 永久失败（终结）的终点保留原回执，其余终点在此
+-- 表中标记 outcome='revoked'；其现有租约在同一事务内被置为已结束而立即失效。
+-- 撤销后：领取不再返回这些终点，直接回执与令牌完成对其明确拒绝（已记录回执的
+-- 同序号同结果重放仍原样返回）。判定重放、历史报表与熔断统计完全不读本表。
+CREATE TABLE IF NOT EXISTS delivery_revocations (
+    delivery_id TEXT PRIMARY KEY REFERENCES delivery_decisions (delivery_id),
+    reason      TEXT NOT NULL,                    -- 去空白后非空的撤销原因（首次操作原样留存）
+    created_at  TEXT NOT NULL                     -- 首次撤销操作时刻（逐终点共用）
+);
+
+CREATE TABLE IF NOT EXISTS delivery_revocation_endpoints (
+    delivery_id TEXT NOT NULL REFERENCES delivery_revocations (delivery_id),
+    mailbox     TEXT NOT NULL,                    -- 判定终点邮箱（规范化小写）
+    outcome     TEXT NOT NULL CHECK (outcome IN ('revoked', 'delivered', 'permanent_failure')),
+    revoked_at  TEXT,                             -- outcome='revoked' 时为撤销时刻；终结保留项为 NULL
+    PRIMARY KEY (delivery_id, mailbox)
 );
 
 -- 终点邮箱域名的同时在途领取数上限（管理员配置，按域名一行；未配置的域名不受限）。

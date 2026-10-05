@@ -106,6 +106,12 @@ class DeliveryReceiptIn(BaseModel):
     result: Literal["temporary_failure", "permanent_failure", "delivered"]
 
 
+class DeliveryRevokeIn(BaseModel):
+    """投递操作方撤销某投递编号尚未终结的终点任务：去空白后非空的撤销原因。"""
+
+    reason: str = Field(description="撤销原因（去空白后不得为空）")
+
+
 class TaskClaimIn(BaseModel):
     """投递系统领取可执行终点任务：领取上限（1～100）与租约秒数（1～3600）。"""
 
