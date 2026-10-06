@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、投递任务租约（到期 / 退避入列、领取与令牌回执、按终点邮箱域名限制同时在途领取数）、历史判定核对报表与灰度自动熔断。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、投递任务租约（到期 / 退避入列、领取与令牌回执、按终点邮箱域名限制同时在途领取数）、终点任务撤销（一次性标记尚未终结的终点并使既有租约失效）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import json
@@ -726,6 +726,20 @@ class ReceiptEndpointClosed(Exception):
         self.attempt_no = attempt_no
 
 
+class ReceiptEndpointRevoked(Exception):
+    """该终点任务已被操作方撤销：不再接收新尝试（已记录回执的同序号同结果重放仍原样返回）。"""
+
+    def __init__(self, delivery_id: str, mailbox: str, revoked_at: str, reason: str):
+        super().__init__(
+            f"endpoint {mailbox!r} of delivery {delivery_id!r} was revoked at {revoked_at}; "
+            "new attempts are rejected"
+        )
+        self.delivery_id = delivery_id
+        self.mailbox = mailbox
+        self.revoked_at = revoked_at
+        self.reason = reason
+
+
 def decision_endpoints(decision: dict) -> list[str]:
     """成功判定中按持久化顺序列出的终点邮箱；失败判定无终点。"""
     if decision["status"] != "ok" or not decision["endpoints"]:
@@ -775,8 +789,9 @@ def record_attempt(
     返回该（投递编号, 终点, 序号）的尝试记录——新写入与同序号同结果重放返回同一份内容。
     拒绝顺序：未知编号由调用方先查（返回 None）；原判定失败 → ReceiptDecisionFailed；
     终点不在判定中 → ReceiptEndpointNotAllowed；同序号不同结果 → ReceiptResultConflict；
-    已终结后再收新序号 → ReceiptEndpointClosed；序号不大于已记录最大序号 →
-    ReceiptSequenceConflict。以上拒绝均不写入任何记录。
+    终点已撤销（仅新尝试；已记录回执的同序号同结果重放仍原样返回）→
+    ReceiptEndpointRevoked；已终结后再收新序号 → ReceiptEndpointClosed；
+    序号不大于已记录最大序号 → ReceiptSequenceConflict。以上拒绝均不写入任何记录。
     """
     decision = get_decision(conn, delivery_id)
     if decision is None:
@@ -791,10 +806,16 @@ def record_attempt(
         raise ReceiptEndpointNotAllowed(mailbox, endpoints)
 
     existing = get_attempt(conn, delivery_id, mailbox, attempt_no)
-    if existing is not None:  # 同序号：结果一致原样返回，不一致报冲突（终结状态也不例外）
+    if existing is not None:  # 同序号：结果一致原样返回，不一致报冲突（终结与撤销状态也不例外）
         if existing["result"] != result:
             raise ReceiptResultConflict(existing["result"], result, attempt_no)
         return {"delivery_id": delivery_id, "mailbox": mailbox, **existing}
+
+    revocation = get_endpoint_revocation(conn, delivery_id, mailbox)
+    if revocation is not None:  # 已撤销终点不再接收新尝试；已记录回执的重放已在上面返回
+        raise ReceiptEndpointRevoked(
+            delivery_id, mailbox, revocation["revoked_at"], revocation["reason"]
+        )
 
     last = get_last_attempt(conn, delivery_id, mailbox)
     if last is not None:
@@ -879,11 +900,12 @@ def _parse_utc(value: str) -> datetime:
 
 
 class InvalidLeaseToken(Exception):
-    """租约令牌过期或失效：未知令牌 / 租约已到期 / 已结束 / 已被更新回执抢先。
+    """租约令牌过期或失效：未知令牌 / 租约已到期 / 已结束 / 已被更新回执抢先 / 终点已撤销。
 
     reason 取值：unknown（令牌不存在）、expired（租约已到期，终点可被重领）、
     completed（该令牌已用于提交回执）、superseded（已先记录不早于本租约序号的
-    新回执，令牌失效且不得覆盖）。
+    新回执，令牌失效且不得覆盖）、revoked（终点任务已被操作方撤销，既有租约
+    立即失效且不得再写入回执）。
     """
 
     def __init__(self, reason: str, token: str):
@@ -906,7 +928,7 @@ def claim_due_tasks(
     now_text = current.isoformat(timespec="seconds")
 
     # 成功判定的全部终点 × 该终点最新（序号最大）回执（无回执则最新侧为 NULL）；
-    # 已有有效租约（未结束且未到期）的终点直接排除。退避到期在 Python 侧计算。
+    # 已有有效租约（未结束且未到期）的终点与已撤销的终点直接排除。退避到期在 Python 侧计算。
     rows = conn.execute(
         """
         SELECT d.delivery_id,
@@ -932,6 +954,11 @@ def claim_due_tasks(
                   AND l.mailbox = json_extract(je.value, '$.mailbox')
                   AND l.completed_at IS NULL AND l.lease_expires_at > ?
           )
+          AND NOT EXISTS (
+                SELECT 1 FROM delivery_endpoint_revocations r
+                WHERE r.delivery_id = d.delivery_id
+                  AND r.mailbox = json_extract(je.value, '$.mailbox')
+          )
         ORDER BY d.delivery_id, json_extract(je.value, '$.mailbox')
         """,
         (now_text,),
@@ -956,8 +983,8 @@ def claim_due_tasks(
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
 
     # 管理员配置的终点域名在途上限（未配置的域名不受限）与各域名当前占用。
-    # 占用只数“未完成、未到期且未被更新回执抢先取代”的租约：与上面的候选扫描在
-    # 同一 BEGIN IMMEDIATE 事务 / 同一时间点上计算，配合本事务持有的写锁，
+    # 占用只数“未完成、未到期、未被更新回执抢先取代且未被撤销”的租约：与上面的候选
+    # 扫描在同一 BEGIN IMMEDIATE 事务 / 同一时间点上计算，配合本事务持有的写锁，
     # 并发领取与配置变更都被串行化，核对到的占用即提交时的占用，绝不超额。
     limits = {
         row["domain"]: row["max_in_flight"]
@@ -976,6 +1003,11 @@ def claim_due_tasks(
                     WHERE a.delivery_id = l.delivery_id
                       AND a.mailbox = l.mailbox
                       AND a.attempt_no >= l.attempt_no
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_endpoint_revocations r
+                    WHERE r.delivery_id = l.delivery_id
+                      AND r.mailbox = l.mailbox
               )
             GROUP BY domain
             """,
@@ -1044,11 +1076,12 @@ def complete_lease(
     """凭有效租约令牌原子写入一次回执并结束租约。须在 BEGIN IMMEDIATE 事务内调用。
 
     返回与既有回执接口相同形状的尝试记录（delivery_id / mailbox / attempt_no /
-    result / created_at）。令牌未知、已到期、已结束 → InvalidLeaseToken
-    （unknown / expired / completed）；若既有回执接口先为该终点记录了
-    attempt_no >= 租约序号的新回执 → InvalidLeaseToken（superseded），令牌失效
-    且不得覆盖。校验通过则原子写入 delivery_attempts（结果只增不改的既有约定
-    不变）并把租约标记为已结束。
+    result / created_at）。令牌未知、已结束、已到期 → InvalidLeaseToken
+    （unknown / completed / expired）；终点任务已被撤销 → InvalidLeaseToken
+    （revoked），既有租约立即失效且不得再写入回执；若既有回执接口先为该终点
+    记录了 attempt_no >= 租约序号的新回执 → InvalidLeaseToken（superseded），
+    令牌失效且不得覆盖。校验通过则原子写入 delivery_attempts（结果只增不改的
+    既有约定不变）并把租约标记为已结束。
     """
     lease = conn.execute(
         "SELECT token, delivery_id, mailbox, attempt_no, leased_at, lease_expires_at, "
@@ -1059,6 +1092,9 @@ def complete_lease(
         raise InvalidLeaseToken("unknown", token)
     if lease["completed_at"] is not None:
         raise InvalidLeaseToken("completed", token)
+    if is_endpoint_revoked(conn, lease["delivery_id"], lease["mailbox"]):
+        # 操作方已撤销该终点任务：既有租约立即失效，不得再写入新回执
+        raise InvalidLeaseToken("revoked", token)
     current = now or datetime.now(timezone.utc)
     if lease["lease_expires_at"] <= current.isoformat(timespec="seconds"):
         raise InvalidLeaseToken("expired", token)
@@ -1152,3 +1188,124 @@ def delete_domain_claim_limit(conn: sqlite3.Connection, domain: str) -> bool:
     """
     cur = conn.execute("DELETE FROM domain_claim_limits WHERE domain = ?", (domain,))
     return cur.rowcount > 0
+
+
+# ---------- 终点任务撤销（操作方一次性撤销成功判定中尚未终结的终点任务） ----------
+#
+# 一次撤销在单个 BEGIN IMMEDIATE 事务内核定该编号全部终点：已送达 / 永久失败的终点
+# 保留原回执（终结状态不可逆），其余终点（无回执或最新为暂时失败）标记撤销——
+# 领取不再入列、既有租约立即失效（不占域名在途名额、令牌完成报 revoked）、
+# 直接回执的新尝试一律拒绝；已记录回执的同序号同结果重试仍原样返回。
+# 全部终点已终结时不留任何记录（无可撤销项）；同编号再次撤销原样返回首次操作的
+# 逐终点结果、时间与原因（幂等重放，不重复写入）。撤销只写本节的两张表，
+# 判定重放、核对报表、熔断统计与回执查询的既有约定完全不变。
+
+class NothingToRevoke(Exception):
+    """全部终点已有终结回执（已送达 / 永久失败）：无可撤销项，不留撤销记录。"""
+
+    def __init__(self, endpoints: list[dict]):
+        super().__init__("all endpoints already have terminal receipts; nothing to revoke")
+        self.endpoints = endpoints
+
+
+def _revocation_doc(row: sqlite3.Row) -> dict:
+    endpoints = json.loads(row["endpoints"])
+    return {
+        "delivery_id": row["delivery_id"],
+        "reason": row["reason"],
+        "revoked_at": row["created_at"],
+        "revoked_count": sum(1 for ep in endpoints if ep["outcome"] == "revoked"),
+        "endpoints": endpoints,
+    }
+
+
+def get_revocation(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
+    """读取某投递编号的撤销记录（含首次操作的逐终点结果快照）；未撤销返回 None。"""
+    row = conn.execute(
+        "SELECT delivery_id, reason, endpoints, created_at "
+        "FROM delivery_revocations WHERE delivery_id = ?",
+        (delivery_id,),
+    ).fetchone()
+    return _revocation_doc(row) if row is not None else None
+
+
+def get_endpoint_revocation(
+    conn: sqlite3.Connection, delivery_id: str, mailbox: str
+) -> dict | None:
+    """读取某终点的撤销状态（撤销时刻与原因）；未撤销返回 None。"""
+    row = conn.execute(
+        "SELECT r.revoked_at, v.reason FROM delivery_endpoint_revocations r "
+        "JOIN delivery_revocations v ON v.delivery_id = r.delivery_id "
+        "WHERE r.delivery_id = ? AND r.mailbox = ?",
+        (delivery_id, mailbox),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def is_endpoint_revoked(conn: sqlite3.Connection, delivery_id: str, mailbox: str) -> bool:
+    """该（投递编号, 终点）是否已被撤销。"""
+    return get_endpoint_revocation(conn, delivery_id, mailbox) is not None
+
+
+def revoke_delivery(conn: sqlite3.Connection, delivery_id: str, reason: str) -> dict:
+    """撤销某成功判定中尚未终结的终点任务。须在 BEGIN IMMEDIATE 写事务内调用。
+
+    - 已有撤销记录 → 原样返回首次操作的逐终点结果、时间与原因（幂等重放，不重写）；
+    - 未知编号 → KeyError；原判定失败 → ReceiptDecisionFailed；
+    - 全部终点已终结 → NothingToRevoke（不留任何记录）；
+    - 否则：非终结终点写入 delivery_endpoint_revocations（领取 / 租约 / 新回执随即
+      对其关闭），终结终点保留原回执；把逐终点结果快照与原因写入
+      delivery_revocations 并返回首次操作的完整结果。
+    reason 须已由调用方去空白并确认非空。
+    """
+    existing = get_revocation(conn, delivery_id)
+    if existing is not None:  # 同编号再次撤销：原样返回首次记录，不重复写入
+        return existing
+    decision = get_decision(conn, delivery_id)
+    if decision is None:
+        raise KeyError(delivery_id)
+    if decision["status"] != "ok":
+        raise ReceiptDecisionFailed(
+            decision["status"],
+            decision["error"].get("error") if decision.get("error") else None,
+        )
+
+    revoked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    endpoints_out: list[dict] = []
+    revoked_rows: list[tuple[str, str, str]] = []
+    for mailbox in decision_endpoints(decision):
+        last = get_last_attempt(conn, delivery_id, mailbox)
+        if last is not None and last["result"] in TERMINAL_RESULTS:  # 已终结：保留原回执
+            endpoints_out.append(
+                {
+                    "mailbox": mailbox,
+                    "outcome": "kept_terminal",
+                    "terminal_result": last["result"],
+                    "terminal_attempt_no": last["attempt_no"],
+                }
+            )
+        else:  # 尚未终结（无回执或最新为暂时失败）：标记撤销，既有租约随即失效
+            endpoints_out.append({"mailbox": mailbox, "outcome": "revoked"})
+            revoked_rows.append((delivery_id, mailbox, revoked_at))
+    if not revoked_rows:  # 全部终点已终结：无可撤销项，不留任何记录
+        raise NothingToRevoke(
+            [
+                {
+                    "mailbox": ep["mailbox"],
+                    "terminal_result": ep["terminal_result"],
+                    "terminal_attempt_no": ep["terminal_attempt_no"],
+                }
+                for ep in endpoints_out
+            ]
+        )
+    conn.execute(
+        "INSERT INTO delivery_revocations (delivery_id, reason, endpoints, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (delivery_id, reason, json.dumps(endpoints_out), revoked_at),
+    )
+    conn.executemany(
+        "INSERT INTO delivery_endpoint_revocations (delivery_id, mailbox, revoked_at) "
+        "VALUES (?, ?, ?)",
+        revoked_rows,
+    )
+    return get_revocation(conn, delivery_id)

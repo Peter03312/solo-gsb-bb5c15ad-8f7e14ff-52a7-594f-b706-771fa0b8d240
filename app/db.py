@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、终点域名在途领取上限与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、终点域名在途领取上限、终点任务撤销与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -146,6 +146,27 @@ CREATE TABLE IF NOT EXISTS domain_claim_limits (
     domain        TEXT PRIMARY KEY,                  -- 终点邮箱域名（规范化小写）
     max_in_flight INTEGER NOT NULL CHECK (max_in_flight >= 1),  -- 同时在途领取数的正整数上限
     updated_at    TEXT NOT NULL
+);
+
+-- 终点任务撤销：投递操作方对某个已持久化“成功”判定的一次性撤销（每个投递编号至多一条，
+-- 全部终点已终结时不留任何记录）。首次撤销把尚未终结（无回执或最新为暂时失败）的终点
+-- 标记撤销、已送达 / 永久失败的终点保留原回执，并留存去空白后的非空原因与首次操作的
+-- 逐终点结果快照；同编号再次撤销原样返回该快照（幂等重放，不重复写入）。
+CREATE TABLE IF NOT EXISTS delivery_revocations (
+    delivery_id TEXT PRIMARY KEY REFERENCES delivery_decisions (delivery_id),
+    reason      TEXT NOT NULL,                    -- 去空白后的非空撤销原因
+    endpoints   TEXT NOT NULL,                    -- JSON: 首次操作的逐终点结果快照（重放原样返回）
+    created_at  TEXT NOT NULL
+);
+
+-- 被撤销的 (投递编号, 终点)：领取不再入列、既有租约立即失效（不占域名在途名额）、
+-- 直接回执的新尝试与令牌完成一律明确拒绝；已记录回执的同序号同结果重试仍原样返回。
+-- 与判定 / 策略 / 报表 / 熔断统计完全解耦：撤销不改写任何既有表。
+CREATE TABLE IF NOT EXISTS delivery_endpoint_revocations (
+    delivery_id TEXT NOT NULL REFERENCES delivery_decisions (delivery_id),
+    mailbox     TEXT NOT NULL,                    -- 判定终点邮箱（规范化小写）
+    revoked_at  TEXT NOT NULL,
+    PRIMARY KEY (delivery_id, mailbox)
 );
 """
 

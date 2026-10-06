@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、投递任务领取（到期 / 退避入列 + 租约，凭令牌原子回执）、历史判定核对报表与灰度自动熔断。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、投递任务领取（到期 / 退避入列 + 租约，凭令牌原子回执）、终点任务撤销（一次性撤销尚未终结的终点并使既有租约失效）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -12,6 +12,7 @@ from .models import (
     DeliverRequest,
     DeliveryBatchSubmit,
     DeliveryReceiptIn,
+    DeliveryRevocationIn,
     DeliverySubmit,
     DomainClaimLimitIn,
     DraftChangesRequest,
@@ -752,6 +753,8 @@ def submit_delivery_receipt(delivery_id: str, body: DeliveryReceiptIn) -> dict:
       409 endpoint_not_allowed：均拒绝且不产生记录。
     - 同一终点同一序号同结果重试 → 原样返回首次记录；同序号不同结果 →
       409 attempt_result_conflict。
+    - 终点任务已被撤销 → 409 endpoint_revoked（仅新尝试；已记录回执的同序号
+      同结果重试仍原样返回）。
     - 新序号必须大于该终点已记录的最大序号，否则 409 attempt_sequence_conflict；
       已送达 / 永久失败后再收新尝试 → 409 endpoint_terminal。
     核对与写入在单个 BEGIN IMMEDIATE 事务内完成：并发回传串行化，序号与汇总一致。
@@ -792,6 +795,13 @@ def submit_delivery_receipt(delivery_id: str, body: DeliveryReceiptIn) -> dict:
             detail={"error": "attempt_result_conflict", "delivery_id": delivery_id, "mailbox": mailbox,
                     "attempt_no": exc.attempt_no, "stored_result": exc.stored_result,
                     "submitted_result": exc.submitted_result, "message": str(exc)},
+        )
+    except store.ReceiptEndpointRevoked as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "endpoint_revoked", "delivery_id": delivery_id, "mailbox": mailbox,
+                    "revoked_at": exc.revoked_at, "revocation_reason": exc.reason,
+                    "message": str(exc)},
         )
     except store.ReceiptEndpointClosed as exc:
         raise HTTPException(
@@ -839,6 +849,81 @@ def get_delivery_receipts(delivery_id: str) -> dict:
     return summary
 
 
+# ---------- 终点任务撤销（操作方一次性撤销成功判定中尚未终结的终点任务，幂等重放） ----------
+
+
+@app.post("/deliveries/{delivery_id}/revocation")
+def revoke_delivery(delivery_id: str, body: DeliveryRevocationIn) -> dict:
+    """撤销某已持久化成功判定中尚未终结的终点任务。
+
+    请求体给出撤销原因（去空白后须非空）。一次操作在单个 BEGIN IMMEDIATE 事务内
+    核定该编号全部终点：已送达 / 永久失败的终点保留原回执（逐终点结果中标记
+    kept_terminal），其余终点标记撤销（revoked）并使现有租约立即失效；
+    全部终点已终结时返回 409 nothing_to_revoke 且不留任何记录。
+    同编号再次撤销原样返回首次操作的逐终点结果、时间与原因（不重复写入）。
+    未知编号（404 delivery_not_found）、原判定失败（409 delivery_decision_failed）、
+    空原因（422 invalid_reason）明确报错且不留记录。
+    撤销后：领取不再返回已撤销终点，直接回执的新尝试（409 endpoint_revoked）与
+    令牌完成（409 invalid_lease_token / revoked）对其明确拒绝；判定重放、
+    核对报表与熔断统计不受影响。
+    """
+    reason = body.reason.strip()
+    if not reason:  # 去空白后为空：明确报错，不留记录
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_reason", "delivery_id": delivery_id,
+                    "message": "revocation reason must be non-empty after stripping whitespace"},
+        )
+    try:
+        with db.transaction() as conn:
+            revocation = store.revoke_delivery(conn, delivery_id, reason)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "delivery_not_found", "delivery_id": delivery_id},
+        )
+    except store.ReceiptDecisionFailed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "delivery_decision_failed", "delivery_id": delivery_id,
+                    "decision_status": exc.status, "error_type": exc.error_type,
+                    "message": "only successful delivery decisions have revocable endpoint tasks"},
+        )
+    except store.NothingToRevoke as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "nothing_to_revoke", "delivery_id": delivery_id,
+                    "endpoints": exc.endpoints,
+                    "message": "all endpoints already have terminal receipts; nothing to revoke"},
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return revocation
+
+
+@app.get("/deliveries/{delivery_id}/revocation")
+def get_delivery_revocation(delivery_id: str) -> dict:
+    """查询某投递编号的撤销结果（首次操作的逐终点结果、时间与原因）。
+
+    未知编号 → 404 delivery_not_found；该编号尚无撤销记录（含“全部终点已终结
+    无可撤销项”未留记录的情形）→ 404 revocation_not_found。只读。
+    """
+    with db.read_transaction() as conn:
+        if store.get_decision(conn, delivery_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "delivery_not_found", "delivery_id": delivery_id},
+            )
+        revocation = store.get_revocation(conn, delivery_id)
+    if revocation is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "revocation_not_found", "delivery_id": delivery_id,
+                    "message": "no revocation recorded for this delivery"},
+        )
+    return revocation
+
+
 # ---------- 投递任务领取（可执行终点入列 + 租约；凭令牌原子回执并结束租约） ----------
 
 
@@ -874,9 +959,10 @@ def complete_delivery_claim(token: str, body: LeaseCompleteIn) -> dict:
 
     尝试序号取租约记录的下一尝试序号，回执写入与租约结束在单个 BEGIN
     IMMEDIATE 事务内原子完成。若既有回执接口（POST /deliveries/{id}/receipts）
-    已先为该终点记录了不早于租约序号的新回执，令牌失效且不得覆盖。
-    过期、已结束或未知令牌明确报冲突（409 invalid_lease_token，附 reason：
-    expired / completed / superseded / unknown）。
+    已先为该终点记录了不早于租约序号的新回执，令牌失效且不得覆盖；
+    终点任务被撤销后既有租约同样立即失效，不得再写入回执。
+    过期、已结束、被撤销或未知令牌明确报冲突（409 invalid_lease_token，附 reason：
+    expired / completed / superseded / revoked / unknown）。
     """
     try:
         with db.transaction() as conn:
@@ -886,6 +972,7 @@ def complete_delivery_claim(token: str, body: LeaseCompleteIn) -> dict:
             "expired": "lease has expired; the endpoint may have been re-claimed",
             "completed": "this lease token was already used to submit a receipt",
             "superseded": "a newer receipt for this endpoint was recorded first; the lease is stale and must not overwrite it",
+            "revoked": "the endpoint task was revoked by the operator; the lease is invalidated and must not record a receipt",
             "unknown": "unknown lease token",
         }
         raise HTTPException(

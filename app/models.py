@@ -119,6 +119,12 @@ class LeaseCompleteIn(BaseModel):
     result: Literal["temporary_failure", "permanent_failure", "delivered"]
 
 
+class DeliveryRevocationIn(BaseModel):
+    """撤销某成功判定中尚未终结的终点任务：撤销原因（去空白后须非空，由服务端核定）。"""
+
+    reason: str = Field(max_length=500, description="撤销原因（去空白后须非空）")
+
+
 class DomainClaimLimitIn(BaseModel):
     """管理员设置终点邮箱域名的同时在途领取数上限（正整数）。域名大小写归一、去空白后须为合法域名。"""
 
